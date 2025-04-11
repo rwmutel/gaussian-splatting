@@ -10,23 +10,20 @@
 #
 
 import os
-import torch
-from random import randint
-from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
 import sys
-from scene import Scene, GaussianModel
-from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
-from tqdm import tqdm
-from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TENSORBOARD_FOUND = True
-except ImportError:
-    TENSORBOARD_FOUND = False
+from random import randint
+
+import torch
+import wandb
+from arguments import ModelParams, OptimizationParams, PipelineParams
+from gaussian_renderer import network_gui, render
+from scene import GaussianModel, Scene
+from tqdm import tqdm
+from utils.general_utils import get_expon_lr_func, safe_state
+from utils.image_utils import psnr
+from utils.loss_utils import l1_loss, ssim
 
 try:
     from fused_ssim import fused_ssim
@@ -46,7 +43,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    wandb_run = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -155,7 +152,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(wandb_run, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -189,13 +186,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+    # Close the wandb run when training is complete
+    if wandb_run is not None:
+        wandb_run.finish()
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        args.model_path = os.path.join("./output/", unique_str)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -203,52 +204,84 @@ def prepare_output_and_logger(args):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
-    tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
-    return tb_writer
+    # Initialize Weights & Biases
+    try:
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=os.path.basename(args.model_path),
+            name=args.wandb_run_name,
+            config=vars(args)
+        )
+        print("Weights & Biases initialized for logging")
+        return wandb_run
+    except Exception as e:
+        print(f"Weights & Biases not available: {e}")
+        print("Not logging progress")
+        return None
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
-    if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
+def training_report(wandb_run, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene: Scene, renderFunc, renderArgs, train_test_exp):
+    if wandb_run:
+        # Log scalar metrics
+        wandb_run.log({
+            'train_loss_patches/l1_loss': Ll1.item(), 
+            'train_loss_patches/total_loss': loss.item(),
+            'iter_time': elapsed
+        }, step=iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras()}, 
+                             {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                images_dict = {}  # Store images for wandb logging
+                
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                    
+                    # Save images for wandb logging (only first 5)
+                    if wandb_run and (idx < 5):
+                        # Convert to numpy for wandb
+                        render_np = image.detach().cpu().permute(2, 0, 1).numpy()
+                        images_dict[f"{config['name']}_view_{viewpoint.image_name}/render"] = wandb.Image(render_np)
+                        
                         if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                            gt_np = gt_image.detach().cpu().permute(2, 0, 1).numpy()
+                            images_dict[f"{config['name']}_view_{viewpoint.image_name}/ground_truth"] = wandb.Image(gt_np)
+                    
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                
+                if wandb_run:
+                    # Log scalar metrics
+                    metrics_dict = {
+                        f"{config['name']}/loss_viewpoint - l1_loss": l1_test,
+                        f"{config['name']}/loss_viewpoint - psnr": psnr_test
+                    }
+                    # Combine with images
+                    metrics_dict.update(images_dict)
+                    wandb_run.log(metrics_dict, step=iteration)
 
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        if wandb_run:
+            # Log histogram and total points
+            opacity_values = scene.gaussians.get_opacity.detach().cpu().numpy()
+            wandb_run.log({
+                "scene/opacity_histogram": wandb.Histogram(opacity_values),
+                "total_points": scene.gaussians.get_xyz.shape[0]
+            }, step=iteration)
+            
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -257,16 +290,21 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
+    parser.add_argument('--ip', type=str, default="0.0.0.0")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int,
+                        default=[100, 500, 1_000, 3_000, 7_000, 10_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--wandb_project", type=str, default="gaussian-splatting", 
+                        help="Weights & Biases project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Weights & Biases run name")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
