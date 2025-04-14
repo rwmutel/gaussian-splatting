@@ -24,6 +24,7 @@ from tqdm import tqdm
 from utils.general_utils import get_expon_lr_func, safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
+from lpipsPyTorch import lpips
 
 try:
     from fused_ssim import fused_ssim
@@ -248,6 +249,7 @@ def training_report(wandb_run, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                lpips_test = 0.0
                 images_dict = {}  # Store images for wandb logging
                 
                 for idx, viewpoint in enumerate(config['cameras']):
@@ -269,16 +271,19 @@ def training_report(wandb_run, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    lpips_test += lpips(image, gt_image, net_type="vgg").mean().double()
                 
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                l1_test /= len(config['cameras'])
+                lpips_test /= len(config['cameras'])    
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, lpips_test))
                 
                 if wandb_run:
                     # Log scalar metrics
                     metrics_dict = {
                         f"{config['name']}/loss_viewpoint - l1_loss": l1_test,
-                        f"{config['name']}/loss_viewpoint - psnr": psnr_test
+                        f"{config['name']}/loss_viewpoint - psnr": psnr_test,
+                        f"{config['name']}/loss_viewpoint - lpips": lpips_test
                     }
                     # Combine with images
                     metrics_dict.update(images_dict)
@@ -289,7 +294,7 @@ def training_report(wandb_run, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             opacity_values = scene.gaussians.get_opacity.detach().cpu().numpy()
             wandb_run.log({
                 "scene/opacity_histogram": wandb.Histogram(opacity_values),
-                "total_points": scene.gaussians.get_xyz.shape[0]
+                "total_gaussians": scene.gaussians.get_xyz.shape[0]
             }, step=iteration)
             
         torch.cuda.empty_cache()
@@ -305,7 +310,19 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int,
-                        default=[100, 500, 1_000, 3_000, 7_000, 10_000, 30_000])
+                        default=[
+                            100,
+                            500,
+                            1_000,
+                            2_000,
+                            3_000,
+                            4_000,
+                            5_000,
+                            6_000,
+                            7_000,
+                            10_000,
+                            15_000,
+                            30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
