@@ -37,13 +37,24 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(
+    dataset,
+    opt,
+    pipe,
+    testing_iterations,
+    saving_iterations,
+    checkpoint_iterations,
+    checkpoint,
+    debug_from,
+    wandb_project,
+    wandb_run_name
+):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    wandb_run = prepare_output_and_logger(dataset)
+    wandb_run = prepare_output_and_logger(dataset, wandb_project, wandb_run_name)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -190,7 +201,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if wandb_run is not None:
         wandb_run.finish()
 
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args, wandb_project, wandb_run_name):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -207,9 +218,8 @@ def prepare_output_and_logger(args):
     # Initialize Weights & Biases
     try:
         wandb_run = wandb.init(
-            project=args.wandb_project,
-            name=os.path.basename(args.model_path),
-            name=args.wandb_run_name,
+            project=wandb_project,
+            name=wandb_run_name,
             config=vars(args)
         )
         print("Weights & Biases initialized for logging")
@@ -250,11 +260,11 @@ def training_report(wandb_run, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     # Save images for wandb logging (only first 5)
                     if wandb_run and (idx < 5):
                         # Convert to numpy for wandb
-                        render_np = image.detach().cpu().permute(2, 0, 1).numpy()
+                        render_np = image.detach().cpu().permute(1, 2, 0).numpy()
                         images_dict[f"{config['name']}_view_{viewpoint.image_name}/render"] = wandb.Image(render_np)
                         
                         if iteration == testing_iterations[0]:
-                            gt_np = gt_image.detach().cpu().permute(2, 0, 1).numpy()
+                            gt_np = gt_image.detach().cpu().permute(1, 2, 0).numpy()
                             images_dict[f"{config['name']}_view_{viewpoint.image_name}/ground_truth"] = wandb.Image(gt_np)
                     
                     l1_test += l1_loss(image, gt_image).mean().double()
@@ -301,7 +311,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--wandb_project", type=str, default="gaussian-splatting", 
+    parser.add_argument("--wandb_project", type=str, default="thesis", 
                         help="Weights & Biases project name")
     parser.add_argument("--wandb_run_name", type=str, default=None,
                         help="Weights & Biases run name")
@@ -317,7 +327,17 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(
+        lp.extract(args),
+        op.extract(args),
+        pp.extract(args),
+        args.test_iterations,
+        args.save_iterations,
+        args.checkpoint_iterations,
+        args.start_checkpoint,
+        args.debug_from,
+        args.wandb_project,
+        args.wandb_run_name)
 
     # All done
     print("\nTraining complete.")
