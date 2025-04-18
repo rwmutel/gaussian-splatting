@@ -14,6 +14,7 @@ import sys
 import uuid
 from argparse import ArgumentParser, Namespace
 from random import randint
+from time import time
 
 import torch
 import wandb
@@ -48,14 +49,16 @@ def training(
     checkpoint,
     debug_from,
     wandb_project,
-    wandb_run_name
+    wandb_run_name,
+    existing_run_id=None,
 ):
+    total_time = 0.0
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    wandb_run = prepare_output_and_logger(dataset, wandb_project, wandb_run_name)
+    wandb_run = prepare_output_and_logger(dataset, wandb_project, wandb_run_name, existing_run_id=existing_run_id)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -95,6 +98,7 @@ def training(
             except Exception as e:
                 network_gui.conn = None
 
+        start = time()
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -163,12 +167,14 @@ def training(
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            total_time += time() - start  # ignore time for logging
             # Log and save
             training_report(wandb_run, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            start = time()
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -193,16 +199,17 @@ def training(
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
-
+            total_time += time() - start  # ignore time for saving Gaussians
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     # Close the wandb run when training is complete
     if wandb_run is not None:
+        wandb_run.log({"training_time_sec": total_time})
         wandb_run.finish()
 
-def prepare_output_and_logger(args, wandb_project, wandb_run_name):    
+def prepare_output_and_logger(args, wandb_project, wandb_run_name, existing_run_id=None):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -218,6 +225,15 @@ def prepare_output_and_logger(args, wandb_project, wandb_run_name):
 
     # Initialize Weights & Biases
     try:
+        if existing_run_id is not None:
+            wandb_run = wandb.init(
+                project=wandb_project,
+                id=existing_run_id,
+                resume="must",
+            )
+            print(f"Weights & Biases initialized for logging continuing run {existing_run_id}")
+            return wandb_run
+
         wandb_run = wandb.init(
             project=wandb_project,
             name=wandb_run_name,
@@ -332,6 +348,8 @@ if __name__ == "__main__":
                         help="Weights & Biases project name")
     parser.add_argument("--wandb_run_name", type=str, default=None,
                         help="Weights & Biases run name")
+    parser.add_argument("--existing_run_id", type=str, default=None,
+                        help="Weights & Biases existing run ID to resume")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -354,7 +372,8 @@ if __name__ == "__main__":
         args.start_checkpoint,
         args.debug_from,
         args.wandb_project,
-        args.wandb_run_name)
+        args.wandb_run_name,
+        args.existing_run_id)
 
     # All done
     print("\nTraining complete.")
